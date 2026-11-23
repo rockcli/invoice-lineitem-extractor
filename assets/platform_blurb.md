@@ -1,3 +1,5 @@
+**Reference implementation · synthetic data**
+
 This reference implementation demonstrates deterministic, audit-ready PDF invoice line-item extraction paired with strict arithmetic reconciliation and token-level bounding-box provenance. In an in-distribution benchmark across 120 synthetic invoices spanning the 6 generator layouts (standard grids, 2-line wrapped headers with multi-line descriptions, multi-page tables, negative credits and discounts, interleaved group subtotals, and ±2.5pt OCR coordinate jitter; no held-out external vendor layouts included), the geometry-first parser achieves 1.0000 overall field F1, 120/120 exact grand-total checksum reconciliation, and 100.00% valid bounding-box provenance at 17.457 ms p50 and 37.485 ms p95 latency per PDF. Every currency field parses to exact integer cents to eliminate floating-point drift, and a strict-gated fallback interface activates only on checksum failures while rejecting any proposal that violates schema, per-line arithmetic, same-row horizontal token co-location, or unique token consumption across PDF tokens.
 
 Built with AI-assisted tooling; architecture, review, and tests by me.

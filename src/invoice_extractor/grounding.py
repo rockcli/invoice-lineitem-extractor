@@ -299,6 +299,56 @@ def find_text_span_matches_on_page(
     return matches
 
 
+def is_wrapped_description_span_clean(
+    desc_ids: Sequence[TokenId],
+    desc_tokens: Sequence[BBoxToken],
+    page_tokens: Sequence[BBoxToken],
+    *,
+    page: int,
+    anchor_cy: float,
+    row_tol: float = 8.0,
+    skippable_ids: set[TokenId] | None = None,
+) -> bool:
+    """Verify every matched description token stays on the item's row or clean wrap lines."""
+    if not desc_tokens or len(desc_ids) != len(desc_tokens):
+        return False
+    if any(t.page != page or t.cy < anchor_cy - row_tol for t in desc_tokens):
+        return False
+
+    visual_lines = cluster_tokens_into_rows(desc_tokens, y_tol=5.2)
+    anchor_line = visual_lines[0]
+    if abs(desc_tokens[0].cy - anchor_cy) > row_tol or not tokens_row_colocated(
+        anchor_line, row_tol=row_tol
+    ):
+        return False
+    if any(abs(t.cy - anchor_cy) > row_tol for t in anchor_line):
+        return False
+
+    anchor_desc_min_x0 = min(t.x0 for t in anchor_line)
+    id_by_tok = {id(tok): tok_id for tok_id, tok in zip(desc_ids, desc_tokens, strict=True)}
+    anchor_line_ids = {id_by_tok[id(tok)] for tok in anchor_line}
+    matched_set = set(desc_ids)
+    skippable = skippable_ids or set()
+
+    for line in visual_lines[1:]:
+        for tok in line:
+            if tok.x0 < anchor_desc_min_x0 - 8.0 or parse_currency_cents(tok.text) is not None:
+                return False
+            for other_idx, other in enumerate(page_tokens):
+                other_id = (page, other_idx)
+                if other_id in skippable or other_id in anchor_line_ids:
+                    continue
+                if abs(other.cy - tok.cy) > row_tol:
+                    continue
+                if other_id not in matched_set:
+                    return False
+                if parse_currency_cents(other.text) is not None:
+                    return False
+                if other.x0 < anchor_desc_min_x0 - 8.0:
+                    return False
+    return True
+
+
 def find_wrapped_text_matches_on_page(
     target_text: str,
     page: int,
@@ -309,6 +359,7 @@ def find_wrapped_text_matches_on_page(
     anchor_cy: float,
     row_tol: float = 8.0,
     max_wrap_dy: float = 18.0,
+    enforce_row_band: bool = True,
 ) -> list[tuple[list[TokenId], list[BBoxToken]]]:
     """Locate single-line or line-wrapped description tokens anchored at `anchor_cy`."""
     words = normalize_text(target_text).split()
@@ -342,6 +393,8 @@ def find_wrapped_text_matches_on_page(
             if tok_id in blocked:
                 break
             tok = page_tokens[idx]
+            if enforce_row_band and tok.cy < anchor_cy - row_tol:
+                break
             dy = tok.cy - prev_tok.cy
             if dy < -row_tol or dy > max_wrap_dy:
                 break
@@ -353,6 +406,16 @@ def find_wrapped_text_matches_on_page(
             cursor += 1
 
         if cursor == len(words):
+            if enforce_row_band and not is_wrapped_description_span_clean(
+                matched_ids,
+                matched_toks,
+                page_tokens,
+                page=page,
+                anchor_cy=anchor_cy,
+                row_tol=row_tol,
+                skippable_ids=skippable,
+            ):
+                continue
             matches.append((matched_ids, matched_toks))
     return matches
 

@@ -11,12 +11,14 @@ from typing import Any, Protocol
 from invoice_extractor.grounding import (
     TokenId,
     build_provenance,
+    cluster_tokens_into_rows,
     find_cents_token_matches,
     find_cents_token_matches_on_page,
     find_qty_token_matches_on_page,
     find_text_span_matches_on_page,
     find_wrapped_text_matches_on_page,
     index_tokens_by_page,
+    is_wrapped_description_span_clean,
     normalize_text,
     tokens_row_colocated,
     verify_line_item_arithmetic,
@@ -227,6 +229,7 @@ def _diagnose_line_item_failure(
             anchor_cy=0.0,
             row_tol=100_000.0,
             max_wrap_dy=100_000.0,
+            enforce_row_band=False,
         )
         for page, toks in ordered_by_page.items()
     ):
@@ -304,8 +307,19 @@ def _ground_line_item_row(
                         row_tol=row_tol,
                     )
                     for desc_ids, desc_toks in desc_candidates:
+                        anchor_line = cluster_tokens_into_rows(desc_toks, y_tol=5.2)[0]
                         if not tokens_row_colocated(
-                            [*structural_toks, desc_toks[0]], row_tol=row_tol
+                            [*structural_toks, *anchor_line], row_tol=row_tol
+                        ):
+                            continue
+                        if not is_wrapped_description_span_clean(
+                            desc_ids,
+                            desc_toks,
+                            page_tokens,
+                            page=page,
+                            anchor_cy=anchor_cy,
+                            row_tol=row_tol,
+                            skippable_ids=row_structural_ids,
                         ):
                             continue
                         consumed = row_structural_ids | set(desc_ids)

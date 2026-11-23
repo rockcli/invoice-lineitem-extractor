@@ -439,3 +439,150 @@ def test_resolve_fallback_provider_from_env(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("INVOICE_EXTRACTOR_FALLBACK_MODE", "invalid_mode")
     with pytest.raises(ValueError, match="Unsupported INVOICE_EXTRACTOR_FALLBACK_MODE"):
         resolve_fallback_provider()
+
+
+def test_fallback_rejects_cross_row_multiline_description_swallowing() -> None:
+    def tok(x0: float, y0: float, x1: float, text: str) -> BBoxToken:
+        return BBoxToken(page=1, x0=x0, y0=y0, x1=x1, y1=y0 + 10.0, text=text)
+
+    # Row 1 (y=200) and Row 2 (y=214) are 14pt apart (< max_wrap_dy=18pt).
+    # A hallucinated proposal merges Row 1's description with Row 2's SKU/description
+    # (or the entire Row 2), which must be rejected.
+    tight_rows_tokens = {
+        1: [
+            tok(46, 80, 120, "INV-2026-8806"),
+            tok(46, 96, 110, "2026-11-23"),
+            # Row 1 (y=200, cy=205)
+            tok(50, 200, 95, "SKU-A"),
+            tok(120, 200, 165, "Widget"),
+            tok(380, 200, 390, "2"),
+            tok(440, 200, 485, "$150.00"),
+            tok(520, 200, 565, "$300.00"),
+            # Row 2 (y=214, cy=219 -> 14pt below Row 1)
+            tok(50, 214, 95, "SKU-B"),
+            tok(120, 214, 165, "Gadget"),
+            tok(380, 214, 390, "3"),
+            tok(440, 214, 485, "$100.00"),
+            tok(520, 214, 565, "$300.00"),
+            # Summary
+            tok(520, 320, 565, "$300.00"),
+            tok(520, 340, 555, "$0.00"),
+            tok(520, 360, 565, "$300.00"),
+        ]
+    }
+    broken = _dummy_broken_result()
+
+    for swallowed_desc in (
+        "Widget SKU-B Gadget",
+        "Widget SKU-B",
+        "Widget SKU-B Gadget 3 $100.00 $300.00",
+    ):
+        swallowing_payload = {
+            "invoice_no": "INV-2026-8806",
+            "invoice_date": "2026-11-23",
+            "subtotal_cents": 30000,
+            "tax_cents": 0,
+            "credits_cents": 0,
+            "total_cents": 30000,
+            "line_items": [
+                {
+                    "sku": "SKU-A",
+                    "description": swallowed_desc,
+                    "qty": "2",
+                    "unit_price_cents": 15000,
+                    "amount_cents": 30000,
+                }
+            ],
+        }
+        repaired = apply_strict_fallback(
+            broken,  # type: ignore[arg-type]
+            tight_rows_tokens,
+            MockFallbackProvider(payload=swallowing_payload),
+        )
+        assert not repaired.fallback_used, f"Unexpectedly accepted swallowed desc: {swallowed_desc}"
+        assert not repaired.checksum_passed
+        assert repaired.fallback_rejected_reason is not None
+        assert "ungrounded" in repaired.fallback_rejected_reason
+
+    # Even if Row 2 omits an SKU token before "Gadget", jumping 14pt into Row 2
+    # (which carries qty/unit/amount row anchors) must still be rejected.
+    no_sku_row2_tokens = {
+        1: [
+            tok(46, 80, 120, "INV-2026-8806"),
+            tok(46, 96, 110, "2026-11-23"),
+            tok(50, 200, 95, "SKU-A"),
+            tok(120, 200, 165, "Widget"),
+            tok(380, 200, 390, "2"),
+            tok(440, 200, 485, "$150.00"),
+            tok(520, 200, 565, "$300.00"),
+            tok(120, 214, 165, "Gadget"),
+            tok(380, 214, 390, "3"),
+            tok(440, 214, 485, "$100.00"),
+            tok(520, 214, 565, "$300.00"),
+            tok(520, 320, 565, "$300.00"),
+            tok(520, 340, 555, "$0.00"),
+            tok(520, 360, 565, "$300.00"),
+        ]
+    }
+    repaired_no_sku = apply_strict_fallback(
+        broken,  # type: ignore[arg-type]
+        no_sku_row2_tokens,
+        MockFallbackProvider(
+            payload={
+                "invoice_no": "INV-2026-8806",
+                "invoice_date": "2026-11-23",
+                "subtotal_cents": 30000,
+                "tax_cents": 0,
+                "credits_cents": 0,
+                "total_cents": 30000,
+                "line_items": [
+                    {
+                        "sku": "SKU-A",
+                        "description": "Widget Gadget",
+                        "qty": "2",
+                        "unit_price_cents": 15000,
+                        "amount_cents": 30000,
+                    }
+                ],
+            }
+        ),
+    )
+    assert not repaired_no_sku.fallback_used
+    assert not repaired_no_sku.checksum_passed
+    assert repaired_no_sku.fallback_rejected_reason is not None
+    assert "ungrounded" in repaired_no_sku.fallback_rejected_reason
+
+
+def test_fallback_accepts_jittered_ocr_wrapped_description(tmp_path: Path) -> None:
+    dataset = generate_dataset(tmp_path, count=12, seed=42)
+    jittered_items = [item for item in dataset if item.layout == "jittered_ocr_layout"]
+    assert jittered_items
+    for gt in jittered_items:
+        pdf_path = tmp_path / gt.pdf_path
+        tokens_by_page, _ = extract_tokens(pdf_path)
+        base_result = parse_invoice(pdf_path)
+        broken = replace(base_result, checksum_passed=False, line_items=[])
+        valid_payload = {
+            "invoice_no": gt.invoice_no,
+            "invoice_date": gt.invoice_date,
+            "subtotal_cents": gt.subtotal_cents,
+            "tax_cents": gt.tax_cents,
+            "credits_cents": gt.credits_cents,
+            "total_cents": gt.total_cents,
+            "line_items": [
+                {
+                    "sku": it.sku,
+                    "description": it.description,
+                    "qty": str(it.qty),
+                    "unit_price_cents": it.unit_price_cents,
+                    "amount_cents": it.amount_cents,
+                }
+                for it in gt.line_items
+            ],
+        }
+        repaired = apply_strict_fallback(
+            broken, tokens_by_page, MockFallbackProvider(payload=valid_payload)
+        )
+        assert repaired.fallback_used, repaired.fallback_rejected_reason
+        assert repaired.checksum_passed
+        assert verify_invoice_grounding(repaired, tokens_by_page).validity_rate == 1.0
