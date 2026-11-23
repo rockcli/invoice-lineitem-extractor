@@ -9,7 +9,7 @@ from pathlib import Path
 
 from invoice_extractor.eval import run_evaluation
 from invoice_extractor.generator import generate_dataset
-from invoice_extractor.llm_fallback import DisabledFallbackProvider
+from invoice_extractor.llm_fallback import resolve_fallback_provider
 from invoice_extractor.parser import parse_invoice
 
 
@@ -36,6 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--compact",
         action="store_true",
         help="Emit single-line compact JSON instead of indented JSON.",
+    )
+    ext_cmd.add_argument(
+        "--fallback-mode",
+        choices=["disabled", "mock"],
+        default=None,
+        help=(
+            "Fallback provider mode on checksum failure "
+            "(defaults to INVOICE_EXTRACTOR_FALLBACK_MODE or 'disabled')."
+        ),
     )
 
     eval_cmd = sub.add_parser(
@@ -81,7 +90,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "extract":
-        result = parse_invoice(args.pdf, fallback_provider=DisabledFallbackProvider())
+        try:
+            provider = resolve_fallback_provider(args.fallback_mode)
+        except ValueError as exc:
+            parser.error(str(exc))
+        result = parse_invoice(args.pdf, fallback_provider=provider)
         indent = None if args.compact else 2
         print(json.dumps(result.to_dict(), indent=indent))
         return 0 if result.checksum_passed else 1

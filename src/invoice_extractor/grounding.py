@@ -5,11 +5,16 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from invoice_extractor.models import BBoxToken, InvoiceResult, Provenance, union_bbox
 
-_CURRENCY_CLEAN_RE = re.compile(r"^\(?[-+]?\$?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?$")
+TokenId = tuple[int, int]
+
+_CURRENCY_NUMBER_RE = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})?"
+_CURRENCY_CLEAN_RE = re.compile(
+    rf"^(?:\([-+]?\$?{_CURRENCY_NUMBER_RE}\)|[-+]?\$?{_CURRENCY_NUMBER_RE})$"
+)
 _SIMPLE_DECIMAL_RE = re.compile(r"^[-+]?\d+(?:\.\d+)?$")
 
 
@@ -160,6 +165,196 @@ def verify_provenance(
     obs_words = set(observed.split())
     exp_words = expected.split()
     return bool(exp_words) and all(word in obs_words for word in exp_words)
+
+
+def verify_line_item_arithmetic(
+    qty: Decimal,
+    unit_price_cents: int,
+    amount_cents: int,
+) -> bool:
+    """Verify exact cent line arithmetic (exact for integer qty, <=1 cent for fractional qty)."""
+    expected_cents = int(
+        (qty * Decimal(unit_price_cents)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    tolerance = 0 if qty == qty.to_integral_value() else 1
+    return abs(expected_cents - amount_cents) <= tolerance
+
+
+def tokens_row_colocated(tokens: Sequence[BBoxToken], *, row_tol: float = 8.0) -> bool:
+    """Return True when all tokens lie on the same page within `row_tol` vertical midpoint delta."""
+    if not tokens:
+        return False
+    page = tokens[0].page
+    if any(t.page != page for t in tokens):
+        return False
+    y_mids = [t.cy for t in tokens]
+    return (max(y_mids) - min(y_mids)) <= row_tol
+
+
+def index_tokens_by_page(tokens_by_page: dict[int, list[BBoxToken]]) -> dict[int, list[BBoxToken]]:
+    """Return reading-order normalized tokens per page for stable TokenId indexing."""
+    return {page: flatten_reading_order(tokens_by_page[page]) for page in sorted(tokens_by_page)}
+
+
+def find_cents_token_matches(
+    target_cents: int,
+    ordered_by_page: dict[int, list[BBoxToken]],
+    *,
+    excluded: set[TokenId] | None = None,
+    reverse_scan: bool = False,
+) -> list[tuple[TokenId, BBoxToken]]:
+    """Return all `(TokenId, BBoxToken)` pairs matching `target_cents` not in `excluded`."""
+    blocked = excluded or set()
+    matches: list[tuple[TokenId, BBoxToken]] = []
+    pages = sorted(ordered_by_page, reverse=reverse_scan)
+    for page in pages:
+        toks = ordered_by_page[page]
+        indices = range(len(toks) - 1, -1, -1) if reverse_scan else range(len(toks))
+        for idx in indices:
+            tok_id = (page, idx)
+            if tok_id in blocked:
+                continue
+            tok = toks[idx]
+            parsed = parse_currency_cents(tok.text)
+            if parsed is not None and parsed == target_cents:
+                matches.append((tok_id, tok))
+    return matches
+
+
+def find_qty_token_matches_on_page(
+    target_qty: Decimal,
+    page: int,
+    page_tokens: Sequence[BBoxToken],
+    *,
+    excluded: set[TokenId] | None = None,
+    anchor_cy: float | None = None,
+    row_tol: float = 8.0,
+) -> list[tuple[TokenId, BBoxToken]]:
+    """Return `(TokenId, BBoxToken)` pairs on `page` matching `target_qty`."""
+    blocked = excluded or set()
+    matches: list[tuple[TokenId, BBoxToken]] = []
+    for idx, tok in enumerate(page_tokens):
+        tok_id = (page, idx)
+        if tok_id in blocked:
+            continue
+        if anchor_cy is not None and abs(tok.cy - anchor_cy) > row_tol:
+            continue
+        parsed = parse_decimal_qty(tok.text)
+        if parsed is not None and parsed == target_qty:
+            matches.append((tok_id, tok))
+    return matches
+
+
+def find_cents_token_matches_on_page(
+    target_cents: int,
+    page: int,
+    page_tokens: Sequence[BBoxToken],
+    *,
+    excluded: set[TokenId] | None = None,
+    anchor_cy: float | None = None,
+    row_tol: float = 8.0,
+) -> list[tuple[TokenId, BBoxToken]]:
+    """Return all `(TokenId, BBoxToken)` on `page` matching `target_cents`."""
+    blocked = excluded or set()
+    matches: list[tuple[TokenId, BBoxToken]] = []
+    for idx, tok in enumerate(page_tokens):
+        tok_id = (page, idx)
+        if tok_id in blocked:
+            continue
+        if anchor_cy is not None and abs(tok.cy - anchor_cy) > row_tol:
+            continue
+        parsed = parse_currency_cents(tok.text)
+        if parsed is not None and parsed == target_cents:
+            matches.append((tok_id, tok))
+    return matches
+
+
+def find_text_span_matches_on_page(
+    target_text: str,
+    page: int,
+    page_tokens: Sequence[BBoxToken],
+    *,
+    excluded: set[TokenId] | None = None,
+    anchor_cy: float | None = None,
+    row_tol: float = 8.0,
+) -> list[tuple[list[TokenId], list[BBoxToken]]]:
+    """Return contiguous token spans on `page` matching `target_text`."""
+    target_norm = normalize_text(target_text)
+    if not target_norm:
+        return []
+    target_parts = target_norm.split()
+    n_parts = len(target_parts)
+    blocked = excluded or set()
+    matches: list[tuple[list[TokenId], list[BBoxToken]]] = []
+
+    for start in range(len(page_tokens) - n_parts + 1):
+        ids = [(page, start + offset) for offset in range(n_parts)]
+        if any(tok_id in blocked for tok_id in ids):
+            continue
+        window = list(page_tokens[start : start + n_parts])
+        if anchor_cy is not None and any(abs(t.cy - anchor_cy) > row_tol for t in window):
+            continue
+        if [normalize_text(t.text) for t in window] == target_parts:
+            matches.append((ids, window))
+    return matches
+
+
+def find_wrapped_text_matches_on_page(
+    target_text: str,
+    page: int,
+    page_tokens: Sequence[BBoxToken],
+    *,
+    excluded: set[TokenId] | None = None,
+    skippable_ids: set[TokenId] | None = None,
+    anchor_cy: float,
+    row_tol: float = 8.0,
+    max_wrap_dy: float = 18.0,
+) -> list[tuple[list[TokenId], list[BBoxToken]]]:
+    """Locate single-line or line-wrapped description tokens anchored at `anchor_cy`."""
+    words = normalize_text(target_text).split()
+    if not words:
+        return []
+    blocked = excluded or set()
+    skippable = skippable_ids or set()
+    matches: list[tuple[list[TokenId], list[BBoxToken]]] = []
+
+    for start in range(len(page_tokens)):
+        start_id = (page, start)
+        if start_id in blocked or start_id in skippable:
+            continue
+        start_tok = page_tokens[start]
+        if abs(start_tok.cy - anchor_cy) > row_tol:
+            continue
+        if normalize_text(start_tok.text) != words[0]:
+            continue
+
+        matched_ids: list[TokenId] = [start_id]
+        matched_toks: list[BBoxToken] = [start_tok]
+        cursor = 1
+        prev_tok = start_tok
+
+        for idx in range(start + 1, len(page_tokens)):
+            if cursor >= len(words):
+                break
+            tok_id = (page, idx)
+            if tok_id in skippable:
+                continue
+            if tok_id in blocked:
+                break
+            tok = page_tokens[idx]
+            dy = tok.cy - prev_tok.cy
+            if dy < -row_tol or dy > max_wrap_dy:
+                break
+            if normalize_text(tok.text) != words[cursor]:
+                break
+            matched_ids.append(tok_id)
+            matched_toks.append(tok)
+            prev_tok = tok
+            cursor += 1
+
+        if cursor == len(words):
+            matches.append((matched_ids, matched_toks))
+    return matches
 
 
 def find_text_token_span(

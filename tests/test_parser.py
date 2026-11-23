@@ -5,9 +5,12 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from reportlab.lib.pagesizes import LETTER
+from reportlab.pdfgen.canvas import Canvas
 
 from invoice_extractor.generator import generate_dataset
 from invoice_extractor.grounding import parse_currency_cents
+from invoice_extractor.llm_fallback import MockFallbackProvider
 from invoice_extractor.models import LAYOUT_TYPES, BBoxToken
 from invoice_extractor.parser import (
     _CandidateRow,
@@ -18,11 +21,19 @@ from invoice_extractor.parser import (
 
 def test_parse_currency_cents_variants() -> None:
     assert parse_currency_cents("$1,240.00") == 124000
+    assert parse_currency_cents("$1240.00") == 124000
+    assert parse_currency_cents("1240.00") == 124000
+    assert parse_currency_cents("($1240.00)") == -124000
+    assert parse_currency_cents("(1240.00)") == -124000
+    assert parse_currency_cents("-$1240.00") == -124000
+    assert parse_currency_cents("-1240.00") == -124000
     assert parse_currency_cents("($45.00)") == -4500
     assert parse_currency_cents("-45.00") == -4500
     assert parse_currency_cents("-$45.00") == -4500
     assert parse_currency_cents("0.00") == 0
     assert parse_currency_cents("$0.00") == 0
+    assert parse_currency_cents("$1,24.00") is None
+    assert parse_currency_cents("$12.34.56") is None
     assert parse_currency_cents("not-money") is None
 
 
@@ -110,11 +121,122 @@ def test_subset_sum_disambiguates_ambiguous_subtotal_vs_flat_fee() -> None:
     assert [r.amount_cents for r in resolved] == [50000, 7500]
     assert any("subset-sum" in w for w in warnings)
 
-    # Also test Case 3: over-counted definite row dropped when definite > target
+    # Definite rows MUST NEVER be dropped even when definite_sum > target_subtotal_cents
     duplicate_definite = replace(definite_1, amount_cents=50000)
     resolved_3, warnings_3 = disambiguate_candidate_rows(
         [definite_1, duplicate_definite],
         target_subtotal_cents=50000,
     )
-    assert len(resolved_3) == 1
-    assert any("pruned" in w for w in warnings_3)
+    assert len(resolved_3) == 2
+    assert sum(r.amount_cents for r in resolved_3) == 100000
+    assert any("preserving all 2 definite" in w for w in warnings_3)
+
+    # Reaching max_states without an unambiguous exhaustive match must preserve definite rows
+    many_ambiguous = [
+        _CandidateRow(
+            page=1,
+            kind="ambiguous",
+            desc_tokens=[make_tok(f"Opt{i}", 160 + i * 20)],
+            amount_tokens=[make_tok("$10.00", 160 + i * 20)],
+            amount_cents=1000,
+        )
+        for i in range(10)
+    ]
+    resolved_cap, warnings_cap = disambiguate_candidate_rows(
+        [definite_1, *many_ambiguous],
+        target_subtotal_cents=55000,
+        max_states=5,
+    )
+    assert len(resolved_cap) == 1
+    assert resolved_cap[0].amount_cents == 50000
+    assert any("max_states=5" in w for w in warnings_cap)
+
+
+def _write_custom_invoice_pdf(
+    pdf_path: Path,
+    *,
+    rows: list[tuple[str, str, str, str, str]],
+    subtotal_str: str,
+    tax_str: str,
+    total_str: str,
+) -> None:
+    c = Canvas(str(pdf_path), pagesize=LETTER)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(46, 742, "Acme Verification Supply Inc.")
+    c.setFont("Helvetica", 9.5)
+    c.drawString(46, 720, "Invoice No: INV-2026-9001")
+    c.drawString(46, 706, "Invoice Date: 2026-11-23")
+
+    c.setFont("Helvetica-Bold", 8.5)
+    c.drawString(50, 660, "SKU")
+    c.drawString(122, 660, "Description")
+    c.drawRightString(388, 660, "Qty")
+    c.drawRightString(468, 660, "Unit Price")
+    c.drawRightString(562, 660, "Amount")
+
+    y = 635.0
+    c.setFont("Helvetica", 8.8)
+    for sku, desc, qty, unit_price, amount in rows:
+        c.drawString(50, y, sku)
+        c.drawString(122, y, desc)
+        c.drawRightString(388, y, qty)
+        c.drawRightString(468, y, unit_price)
+        c.drawRightString(562, y, amount)
+        y -= 22.0
+
+    c.drawRightString(468, y - 20, "Subtotal:")
+    c.drawRightString(562, y - 20, subtotal_str)
+    c.drawRightString(468, y - 36, "Tax:")
+    c.drawRightString(562, y - 36, tax_str)
+    c.drawRightString(468, y - 54, "Grand Total:")
+    c.drawRightString(562, y - 54, total_str)
+    c.save()
+
+
+def test_parse_invoice_supports_ungrouped_four_digit_amounts(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "ungrouped_amounts.pdf"
+    _write_custom_invoice_pdf(
+        pdf_path,
+        rows=[
+            ("HW-100", "Precision Servo Drive", "1", "$1240.00", "$1240.00"),
+            ("HW-200", "Linear Actuator Kit", "1", "1240.00", "1240.00"),
+            ("CR-001", "Volume Rebate Credit", "1", "(1240.00)", "(1240.00)"),
+        ],
+        subtotal_str="1240.00",
+        tax_str="0.00",
+        total_str="$1240.00",
+    )
+
+    result = parse_invoice(pdf_path)
+    assert result.checksum_passed, result.checksum_detail
+    assert len(result.line_items) == 3
+    assert [it.amount_cents.value for it in result.line_items] == [124000, 124000, -124000]
+    assert result.subtotal_cents.value == 124000
+    assert result.total_cents.value == 124000
+
+
+def test_mismatched_invoice_subtotal_preserves_definite_items_and_triggers_fallback(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "mismatched_subtotal.pdf"
+    # Two definite line items ($500.00 + $500.00 = $1,000.00), but invoice prints Subtotal $500.00.
+    _write_custom_invoice_pdf(
+        pdf_path,
+        rows=[
+            ("HW-001", "Radial Bearing Assembly", "2", "$250.00", "$500.00"),
+            ("HW-002", "Stainless Flange Kit", "2", "$250.00", "$500.00"),
+        ],
+        subtotal_str="$500.00",
+        tax_str="$0.00",
+        total_str="$500.00",
+    )
+
+    spy = MockFallbackProvider(payload=None)
+    result = parse_invoice(pdf_path, fallback_provider=spy)
+
+    assert len(result.line_items) == 2
+    assert [it.sku.value for it in result.line_items] == ["HW-001", "HW-002"]
+    assert result.computed_line_sum_cents == 100000
+    assert result.subtotal_cents.value == 50000
+    assert not result.checksum_passed
+    assert spy.call_count == 1

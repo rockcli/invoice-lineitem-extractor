@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from invoice_extractor.cli import main
@@ -49,3 +50,15 @@ def test_cli_generate_extract_and_eval(tmp_path: Path, capsys: object) -> None:
     assert overview_path.exists()
     with Image.open(cover_path) as im:
         assert im.size == (1600, 1200)
+
+
+def test_cli_extract_respects_fallback_mode_env_and_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "generated"
+    assert main(["generate", "--output-dir", str(data_dir), "--count", "1", "--seed", "42"]) == 0
+    sample_pdf = data_dir / "pdfs" / "001_standard_grid.pdf"
+
+    monkeypatch.setenv("INVOICE_EXTRACTOR_FALLBACK_MODE", "mock")
+    assert main(["extract", str(sample_pdf), "--compact"]) == 0
+    assert main(["extract", str(sample_pdf), "--compact", "--fallback-mode", "disabled"]) == 0

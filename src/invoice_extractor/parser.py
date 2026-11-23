@@ -18,6 +18,7 @@ from invoice_extractor.grounding import (
     normalize_text,
     parse_currency_cents,
     parse_decimal_qty,
+    verify_line_item_arithmetic,
 )
 from invoice_extractor.llm_fallback import FallbackProvider, apply_strict_fallback
 from invoice_extractor.models import (
@@ -74,6 +75,7 @@ class _CandidateRow:
     qty_val: Decimal = Decimal("1")
     unit_price_cents: int = 0
     amount_cents: int = 0
+    line_arithmetic_ok: bool = True
 
     def to_line_item(self, *, source: str) -> LineItem:
         all_row_toks = [
@@ -468,6 +470,19 @@ def _assign_numeric_column(tok: BBoxToken, cols: TableColumns) -> str | None:
     return best_col
 
 
+def _looks_like_sku(sku_toks: Sequence[BBoxToken]) -> bool:
+    """Return True if left-column token looks like an explicit item SKU rather than prose."""
+    if len(sku_toks) != 1:
+        return False
+    text = sku_toks[0].text.strip()
+    if not text:
+        return False
+    lowered = text.lower().strip(":.")
+    if lowered in {"section", "group", "subtotal", "total", "summary", "package"}:
+        return False
+    return any(ch.isdigit() for ch in text) or "-" in text
+
+
 def _parse_table_rows(
     page: int,
     rows: list[list[BBoxToken]],
@@ -546,11 +561,10 @@ def _parse_table_rows(
         unit_cents = parse_currency_cents(unit_toks[-1].text) if unit_toks else None
 
         if qty_val is not None and unit_cents is not None and desc_toks:
-            expected_cents = int((qty_val * unit_cents).to_integral_value())
-            kind = "definite" if expected_cents == amt_cents else "ambiguous"
+            line_math_ok = verify_line_item_arithmetic(qty_val, unit_cents, amt_cents)
             item_row = _CandidateRow(
                 page=page,
-                kind=kind,
+                kind="definite",
                 sku_tokens=sku_toks,
                 desc_tokens=desc_toks,
                 qty_tokens=qty_toks,
@@ -559,6 +573,23 @@ def _parse_table_rows(
                 qty_val=qty_val,
                 unit_price_cents=unit_cents,
                 amount_cents=amt_cents,
+                line_arithmetic_ok=line_math_ok,
+            )
+            candidates.append(item_row)
+            active_item = item_row
+        elif qty_val is None and unit_cents is None and desc_toks and _looks_like_sku(sku_toks):
+            item_row = _CandidateRow(
+                page=page,
+                kind="definite",
+                sku_tokens=sku_toks,
+                desc_tokens=desc_toks,
+                qty_tokens=[],
+                unit_price_tokens=[],
+                amount_tokens=amt_toks,
+                qty_val=Decimal("1"),
+                unit_price_cents=amt_cents,
+                amount_cents=amt_cents,
+                line_arithmetic_ok=True,
             )
             candidates.append(item_row)
             active_item = item_row
@@ -583,18 +614,18 @@ def _parse_table_rows(
     return candidates, active_item
 
 
-def find_exact_subset_indices(
+def _find_subset_with_status(
     amounts: Sequence[int],
     target: int,
     *,
     max_states: int = 50_000,
-) -> list[int] | None:
-    """Find indices of `amounts` summing exactly to `target`, preferring larger cardinality."""
+) -> tuple[list[int] | None, bool, bool]:
+    """Return `(best_indices, max_states_exceeded, tied_at_best_cardinality)`."""
     if target == 0:
-        return []
+        return [], False, False
     n = len(amounts)
     if n == 0:
-        return None
+        return None, False, False
 
     # Suffix positive/negative bounds for branch-and-bound pruning
     pos_suffix = [0] * (n + 1)
@@ -606,35 +637,61 @@ def find_exact_subset_indices(
 
     best: list[int] | None = None
     steps = 0
+    exceeded = False
+    tied = False
 
     def dfs(idx: int, current_sum: int, chosen: list[int]) -> None:
-        nonlocal best, steps
+        nonlocal best, steps, exceeded, tied
         steps += 1
         if steps > max_states:
+            exceeded = True
             return
         if current_sum + pos_suffix[idx] < target or current_sum + neg_suffix[idx] > target:
             return
         if idx == n:
-            if current_sum == target and (best is None or len(chosen) > len(best)):
-                best = list(chosen)
+            if current_sum == target:
+                if best is None or len(chosen) > len(best):
+                    best = list(chosen)
+                    tied = False
+                elif len(chosen) == len(best):
+                    tied = True
             return
 
         # Try including idx first to favor keeping genuine line items
         chosen.append(idx)
         dfs(idx + 1, current_sum + amounts[idx], chosen)
         chosen.pop()
-        if steps <= max_states:
+        if not exceeded:
             dfs(idx + 1, current_sum, chosen)
 
     dfs(0, 0, [])
+    return best, exceeded, tied
+
+
+def find_exact_subset_indices(
+    amounts: Sequence[int],
+    target: int,
+    *,
+    max_states: int = 50_000,
+) -> list[int] | None:
+    """Find indices of `amounts` summing exactly to `target`, preferring larger cardinality."""
+    best, exceeded, _tied = _find_subset_with_status(amounts, target, max_states=max_states)
+    if exceeded:
+        return None
     return best
 
 
 def disambiguate_candidate_rows(
     candidates: Sequence[_CandidateRow],
     target_subtotal_cents: int,
+    *,
+    max_states: int = 50_000,
 ) -> tuple[list[_CandidateRow], list[str]]:
-    """Resolve definite items vs ambiguous/subtotal rows using exact-cent subset-sum."""
+    """Resolve definite items vs ambiguous/subtotal rows using exact-cent subset-sum.
+
+    Definite verified line items are never dropped to force a subtotal match; subset-sum
+    only selects among ambiguous/optional candidate rows alongside all definite items.
+    """
     warnings: list[str] = []
     definite = [r for r in candidates if r.kind == "definite"]
     ambiguous = [r for r in candidates if r.kind == "ambiguous"]
@@ -642,14 +699,29 @@ def disambiguate_candidate_rows(
 
     definite_sum = sum(r.amount_cents for r in definite)
     if definite_sum == target_subtotal_cents:
-        if subtotals:
-            warnings.append(f"filtered {len(subtotals)} group subtotal row(s)")
+        if subtotals or ambiguous:
+            warnings.append(f"filtered {len(subtotals) + len(ambiguous)} subtotal/ambiguous row(s)")
         return definite, warnings
 
-    # Case 2: definite rows fall short and ambiguous rows may hold flat-fee items vs subtotals
     if ambiguous:
         residual = target_subtotal_cents - definite_sum
-        subset = find_exact_subset_indices([r.amount_cents for r in ambiguous], residual)
+        subset, exceeded, tied = _find_subset_with_status(
+            [r.amount_cents for r in ambiguous],
+            residual,
+            max_states=max_states,
+        )
+        if exceeded:
+            warnings.append(
+                f"subset-sum disambiguation exceeded max_states={max_states}; "
+                f"preserving {len(definite)} definite line item(s)"
+            )
+            return (definite if definite else list(ambiguous)), warnings
+        if tied:
+            warnings.append(
+                "subset-sum disambiguation found multiple ambiguous matches; "
+                f"preserving {len(definite)} definite line item(s)"
+            )
+            return (definite if definite else list(ambiguous)), warnings
         if subset is not None:
             chosen_ids = {id(ambiguous[idx]) for idx in subset}
             resolved = [
@@ -664,16 +736,11 @@ def disambiguate_candidate_rows(
             )
             return resolved, warnings
 
-    # Case 3: definite rows overshot target (e.g. an unlabeled subtotal looked like a line item)
-    pool = [r for r in candidates if r.kind != "subtotal_label"]
-    subset_all = find_exact_subset_indices([r.amount_cents for r in pool], target_subtotal_cents)
-    if subset_all is not None:
-        chosen_all = set(subset_all)
-        resolved_all = [r for i, r in enumerate(pool) if i in chosen_all]
-        warnings.append(f"subset-sum pruned {len(pool) - len(resolved_all)} over-counted row(s)")
-        return resolved_all, warnings
-
-    return [*definite, *ambiguous], warnings
+    warnings.append(
+        f"definite line items sum ({definite_sum}) != subtotal ({target_subtotal_cents}); "
+        f"preserving all {len(definite)} definite line item(s)"
+    )
+    return (definite if definite else list(ambiguous)), warnings
 
 
 def parse_invoice(
@@ -731,9 +798,13 @@ def parse_invoice(
     line_items = [row.to_line_item(source=source) for row in resolved_rows]
     line_sum = sum(item.amount_cents.value for item in line_items)
     expected_grand = summary.subtotal.value + summary.tax.value - summary.credits.value
+    all_lines_math_ok = all(row.line_arithmetic_ok for row in resolved_rows)
+    if not all_lines_math_ok:
+        warnings.append("one or more line items failed qty * unit_price == amount check")
 
     checksum_passed = (
         bool(line_items)
+        and all_lines_math_ok
         and bool(inv_no_f.value)
         and bool(inv_date_f.value)
         and summary.subtotal.provenance is not None
